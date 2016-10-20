@@ -5786,10 +5786,13 @@ class LibvirtDriver(driver.ComputeDriver):
                 is_shared_instance_path = migrate_data.get(
                         'is_shared_instance_path', True)
             if not is_shared_instance_path:
-                instance_dir = libvirt_utils.get_instance_path_at_destination(
-                                instance, migrate_data)
-                if os.path.exists(instance_dir):
-                        shutil.rmtree(instance_dir)
+                if CONF.libvirt.images_type == 'lvm' and CONF.libvirt.images_volume_group:
+                    self._cleanup_lvm(instance)
+                else:
+                    instance_dir = libvirt_utils.get_instance_path_at_destination(
+                                    instance, migrate_data)
+                    if os.path.exists(instance_dir):
+                            shutil.rmtree(instance_dir)
 
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk_info, migrate_data=None):
@@ -5807,6 +5810,19 @@ class LibvirtDriver(driver.ComputeDriver):
 
         image_meta = utils.get_image_from_system_metadata(
             instance.system_metadata)
+
+        vg = None
+        if CONF.libvirt.images_type == 'lvm' and CONF.libvirt.images_volume_group:
+            try:
+                _disk_info = jsonutils.loads(disk_info)
+            except:
+                _disk_info = []
+
+            for info in _disk_info:
+                base = os.path.basename(info['path'])
+                vg = os.path.join('/dev', CONF.libvirt.images_volume_group)
+                if info['path'].startswith(vg + os.path.sep):
+                    lvm.create_volume(vg, base, info['virt_disk_size'] )
 
         if not (is_shared_instance_path and is_shared_block_storage):
             # NOTE(dims): Using config drive with iso format does not work
@@ -6028,6 +6044,9 @@ class LibvirtDriver(driver.ComputeDriver):
         :param network_info: instance network information
         """
         self.unplug_vifs(instance, network_info)
+
+        if CONF.libvirt.images_type == 'lvm' and CONF.libvirt.images_volume_group:
+            self._cleanup_lvm(instance)
 
     def post_live_migration_at_destination(self, context,
                                            instance,
