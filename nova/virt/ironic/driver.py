@@ -58,6 +58,7 @@ from nova.virt.ironic import ironic_states
 from nova.virt.ironic import patcher
 from nova.virt import netutils
 
+from nova.network.neutronv2 import api as neutron_api
 
 ironic = None
 
@@ -934,7 +935,7 @@ class IronicDriver(virt_driver.ComputeDriver):
         """
         return True
 
-    def _get_network_metadata(self, node, network_info):
+    def _get_network_metadata(self, node, network_info, context):
         """Gets a more complete representation of the instance network info.
 
         This data is exposed as network_data.json in the metadata service and
@@ -943,6 +944,7 @@ class IronicDriver(virt_driver.ComputeDriver):
         :param node: The node object.
         :param network_info: Instance network information.
         """
+
         base_metadata = netutils.get_network_metadata(network_info)
 
         # TODO(vdrok): change to doing a single "detailed vif list" call,
@@ -961,9 +963,13 @@ class IronicDriver(virt_driver.ComputeDriver):
                 if vif_id:
                     vif_id_to_objects[name][vif_id] = p
 
+        # Maps vif ids to created links for speed
+        vif_id_to_links = {}
+
         additional_links = []
         for link in base_metadata['links']:
             vif_id = link['vif_id']
+            vif_id_to_links[vif_id] = link
             if vif_id in vif_id_to_objects['portgroups']:
                 pg = vif_id_to_objects['portgroups'][vif_id]
                 pg_ports = [p for p in ports if p.portgroup_uuid == pg.uuid]
@@ -997,8 +1003,95 @@ class IronicDriver(virt_driver.ComputeDriver):
                 link.update({'ethernet_mac_address': p.address,
                              'type': 'phy'})
 
+        # This section uses neutron to get information about ports so that
+        # VLAN links and networks can be built and sent to the instance,
+        # which can then automatically set up it's /etc/networks/interface
+        # and connect the create instance to the requested VLANs
+        neutron = neutron_api.get_client(context)
+        net_num = len(base_metadata['networks'])-1
+        additional_networks = []
+
+        # This mostly mimics the logic in netutils.get_network_metadata for
+        # trunk subports using neutron objects rather than nova VIFs
+        for vif in network_info:
+            vif_id = vif['id']
+
+            neutron_port = neutron.show_port(vif_id)
+            neutron_port = neutron_port['port']
+
+            # Trunks are identified by presence of trunk details
+            trunk_details = neutron_port.get('trunk_details')
+            vif_link = vif_id_to_links.get(vif_id)
+
+            if vif_link and trunk_details:
+                for subport in trunk_details.get('sub_ports', []):
+                    sp = neutron.show_port(subport['port_id'])['port']
+
+                    network_id = sp.get('network_id')
+                    if network_id:
+                        network = neutron.show_network(network_id)['network']
+                        subnet_v4, subnet_v6 = self._get_first_subnets(neutron, network)
+
+                        if subnet_v4:
+                            net_num += 1
+                            net = self._get_nets(network_id, subnet_v4, 4, net_num, subport['port_id'])
+                            if net:
+                                additional_networks.append(net)
+
+                        if subnet_v6:
+                            net_num += 1
+                            net = self._get_nets(network_id, subnet_v6, 6, net_num, subport['port_id'])
+                            if net:
+                                additional_networks.append(net)
+
+                    link = {
+                        'ethernet_mac_address': subport['mac_address'],
+                        'vlan_mac_address': subport['mac_address'],
+                        'id': subport['port_id'],
+                        'type': 'vlan',
+                        'vlan_id': subport['segmentation_id'],
+                        'vlan_link': vif_link['id']
+
+                    }
+
+                    additional_links.append(link)
+
         base_metadata['links'].extend(additional_links)
+        base_metadata['networks'].extend(additional_networks)
+
         return base_metadata
+
+    def _get_nets(self, network_id, subnet, version, net_num, link_id):
+        if subnet.get('ipv6_address_mode'):
+            LOG.warning('Only DHCP is currently supported for IPv6; '
+                        'manual setup will be necessary!')
+            return None
+        elif subnet.get('enable_dhcp'):
+            net_info = {
+                'id': 'network%d' % net_num,
+                'type': 'ipv%d_dhcp' % version,
+                'link': link_id,
+                'network_id': network_id
+            }
+            return net_info
+
+    def _get_first_subnets(self, neutron, network):
+        subnet_v4 = None
+        subnet_v6 = None
+
+        subnet_ids = network.get('subnets')
+        if subnet_ids:
+            for subnet_id in subnet_ids:
+                subnet = neutron.show_subnet(subnet_id)['subnet']
+
+                # First subnet of each type
+                if subnet['ip_version'] == 4 and not subnet_v4:
+                    subnet_v4 = subnet
+
+                if subnet['ip_version'] == 6 and not subnet_v6:
+                    subnet_v6 = subnet
+
+        return subnet_v4, subnet_v6
 
     def _generate_configdrive(self, context, instance, node, network_info,
                               extra_md=None, files=None):
@@ -1018,7 +1111,8 @@ class IronicDriver(virt_driver.ComputeDriver):
 
         i_meta = instance_metadata.InstanceMetadata(instance,
             content=files, extra_md=extra_md, network_info=network_info,
-            network_metadata=self._get_network_metadata(node, network_info),
+            network_metadata=self._get_network_metadata(node, network_info,
+                                                        context),
             request_context=context)
 
         with tempfile.NamedTemporaryFile() as uncompressed:
